@@ -1,0 +1,218 @@
+//+------------------------------------------------------------------+
+//|                                   LiquiditySweepScalperV2.mq5 |
+//|                                  Copyright 2025, xAI Grok Setup |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, xAI Grok Setup"
+#property link      "https://www.mql5.com"
+#property version   "2.00"
+
+#include <Trade\Trade.mqh>
+
+//--- Inputs
+input double risk = 0.01;  // Risk per trade (1%)
+input double TP_Multiple = 2.0;  // RR Multiple
+input int MagicNumber = 54321;
+input double SL_Pips = 10.0;  // SL in pips
+input int MaxSpreadPoints = 20;  // Max spread in points
+input int SwingBars = 5;  // Bars for swing detection
+input int MaxPositions = 1;  // Max open positions (1-3 for scaling)
+input double TrailStepPips = 5.0;  // Trail SL every X pips profit
+input double TrailBufferPips = 2.0;  // Trail SL by Y pips behind current price
+input ulong Deviation = 10;  // Slippage in points
+
+//--- Globals
+CTrade trade;
+datetime latestBarTime = 0;
+double recentSwingHigh = 0.0;
+double recentSwingLow = 0.0;
+int h1Bias = 0;  // 1=Bull, -1=Bear
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit() {
+    trade.SetExpertMagicNumber(MagicNumber);
+    trade.SetDeviationInPoints(Deviation);
+    Print("Robust Liquidity Sweep Scalper V2 Initialized on M5");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) { }
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick() {
+    MqlTick tick; 
+    if (!SymbolInfoTick(_Symbol, tick)) return;
+    
+    // Spread filter
+    double spread = (tick.ask - tick.bid) / _Point;
+    if (spread > MaxSpreadPoints) return;
+    
+    // Position limit
+    if (CountPositions() >= MaxPositions) {
+        TrailStops();  // Still manage existing
+        return;
+    }
+    
+    if (!IsNewBar()) return;
+    if (!IsInSession()) return;
+    
+    // Update H1 bias (using closed bars)
+    if (!UpdateBias()) return;
+    
+    // Update swings (using closed bars)
+    if (!UpdateSwings()) return;
+    
+    MqlRates rates[]; ArraySetAsSeries(rates, true);
+    if (CopyRates(_Symbol, PERIOD_M5, 1, SwingBars + 3, rates) < SwingBars + 3) return;  // Shift to closed bars
+    
+    // Detect sweep and entry (using closed bars [0]=most recent closed)
+    if (h1Bias == 1 && DetectBullishSweep(rates) && IsBullishEngulfing(rates)) {
+        double sl = NormalizeDouble(tick.bid - (SL_Pips * _Point), _Digits);
+        double tp = NormalizeDouble(tick.ask + (TP_Multiple * SL_Pips * _Point), _Digits);
+        double lots = CalculateLots(tick.ask, sl);
+        if (lots > 0 && trade.Buy(lots, _Symbol, 0.0, sl, tp, "Sweep Buy")) {
+            Print("Buy after Bullish Sweep: ", tick.ask, " SL: ", sl, " TP: ", tp);
+        } else {
+            Print("Buy failed: ", trade.ResultRetcode());
+        }
+    }
+    
+    if (h1Bias == -1 && DetectBearishSweep(rates) && IsBearishEngulfing(rates)) {
+        double sl = NormalizeDouble(tick.bid + (SL_Pips * _Point), _Digits);
+        double tp = NormalizeDouble(tick.bid - (TP_Multiple * SL_Pips * _Point), _Digits);
+        double lots = CalculateLots(tick.bid, sl);
+        if (lots > 0 && trade.Sell(lots, _Symbol, 0.0, sl, tp, "Sweep Sell")) {
+            Print("Sell after Bearish Sweep: ", tick.bid, " SL: ", sl, " TP: ", tp);
+        } else {
+            Print("Sell failed: ", trade.ResultRetcode());
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Helper Functions                                                 |
+//+------------------------------------------------------------------+
+bool IsNewBar() {
+    datetime time[1]; 
+    if (CopyTime(_Symbol, PERIOD_M5, 0, 1, time) < 1) return false;
+    if (time[0] != latestBarTime) { 
+        latestBarTime = time[0]; 
+        return true; 
+    }
+    return false;
+}
+
+bool IsInSession() {
+    MqlDateTime dt; 
+    TimeToStruct(TimeGMT(), dt);
+    int hour = dt.hour;
+    return ((hour >= 8 && hour <= 12) || (hour >= 13 && hour <= 17));  // GMT London/NY
+}
+
+bool UpdateBias() {
+    MqlRates h1[]; ArraySetAsSeries(h1, true);
+    if (CopyRates(_Symbol, PERIOD_H1, 1, 3, h1) < 3) return false;  // Closed bars
+    if (h1[0].close > h1[1].high) h1Bias = 1;  // Bull MSS
+    else if (h1[0].close < h1[1].low) h1Bias = -1;  // Bear MSS
+    else return false;  // No clear bias
+    return true;
+}
+
+bool UpdateSwings() {
+    MqlRates rates[]; ArraySetAsSeries(rates, true);
+    if (CopyRates(_Symbol, PERIOD_M5, 1, SwingBars, rates) < SwingBars) return false;  // Closed bars
+    
+    // Robust swing: Highest high/low in last SwingBars (excluding current)
+    recentSwingHigh = rates[ArrayMaximum(rates, WHOLE_ARRAY, MODE_HIGH)];
+    recentSwingLow = rates[ArrayMinimum(rates, WHOLE_ARRAY, MODE_LOW)];
+    return (recentSwingHigh > 0.0 && recentSwingLow > 0.0);
+}
+
+bool DetectBullishSweep(MqlRates &rates[]) {
+    // Break below swing low on prior closed [1], close above on latest closed [0]
+    return (rates[1].low < recentSwingLow && rates[0].close > recentSwingLow);
+}
+
+bool DetectBearishSweep(MqlRates &rates[]) {
+    // Break above swing high on prior closed [1], close below on latest closed [0]
+    return (rates[1].high > recentSwingHigh && rates[0].close < recentSwingHigh);
+}
+
+bool IsBullishEngulfing(MqlRates &rates[]) {
+    // Latest closed [0] engulfs prior [1]
+    return (rates[1].close < rates[1].open && rates[0].close > rates[1].open && rates[0].open < rates[1].close);
+}
+
+bool IsBearishEngulfing(MqlRates &rates[]) {
+    // Latest closed [0] engulfs prior [1]
+    return (rates[1].close > rates[1].open && rates[0].close < rates[1].open && rates[0].open > rates[1].close);
+}
+
+int CountPositions() {
+    int count = 0;
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        if (PositionGetTicket(i) && PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber) count++;
+    }
+    return count;
+}
+
+bool HasOpenPosition() {
+    return (CountPositions() > 0);
+}
+
+double CalculateLots(double entry, double sl) {
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskAmount = balance * risk;
+    double slDistance = MathAbs(entry - sl);
+    if (slDistance <= 0) return 0.0;
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double lots = riskAmount / (slDistance / _Point * tickValue);
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    return MathMax(minLot, MathMin(maxLot, NormalizeDouble(lots / step, 0) * step));
+}
+
+void TrailStops() {
+    for (int i = PositionsTotal() - 1; i >= 0; i--) {
+        if (PositionGetTicket(i) && PositionGetString(POSITION_SYMBOL) == _Symbol && 
+            PositionGetInteger(POSITION_MAGIC) == MagicNumber) {
+            
+            double posOpen = PositionGetDouble(POSITION_PRICE_OPEN);
+            double posSL = PositionGetDouble(POSITION_SL);
+            double posTP = PositionGetDouble(POSITION_TP);
+            ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+            double currentPrice = (posType == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            
+            double profitDistance = (posType == POSITION_TYPE_BUY) ? (currentPrice - posOpen) : (posOpen - currentPrice);
+            double trailStep = TrailStepPips * _Point;
+            double trailBuffer = TrailBufferPips * _Point;
+            
+            if (profitDistance > trailStep) {
+                double newSL;
+                if (posType == POSITION_TYPE_BUY) {
+                    newSL = NormalizeDouble(currentPrice - trailBuffer, _Digits);
+                    if (newSL > posSL + trailStep) {  // Only move if improved by step
+                        trade.PositionModify(PositionGetTicket(i), newSL, posTP);
+                        Print("Buy SL trailed: ", newSL);
+                    }
+                } else {
+                    newSL = NormalizeDouble(currentPrice + trailBuffer, _Digits);
+                    if (newSL < posSL - trailStep) {
+                        trade.PositionModify(PositionGetTicket(i), newSL, posTP);
+                        Print("Sell SL trailed: ", newSL);
+                    }
+                }
+            }
+        }
+    }
+}
+//+------------------------------------------------------------------+
