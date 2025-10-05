@@ -1,0 +1,211 @@
+//+------------------------------------------------------------------+
+//|                                          GoldHFTScalperV1.mq5 |
+//|                                  Copyright 2025, xAI Grok Setup |
+//|                                             https://www.mql5.com |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2025, xAI Grok Setup"
+#property link      "https://www.mql5.com"
+#property version   "1.00"
+
+#include <Trade\Trade.mqh>
+
+//--- Inputs
+input double risk = 0.005;  // Risk per trade (0.5%)
+input double TP_Multiple = 2.0;  // RR Multiple
+input int MagicNumber = 54321;
+input int EMAShort = 9;
+input int EMALong = 21;
+input int RSIPeriod = 14;
+input double RSIOverbought = 55.0;
+input double RSIOversold = 45.0;
+input int BBPeriod = 20;
+input double BBDeviation = 2.0;
+input int ATRPeriod = 14;
+input double ATRMultiplierSL = 1.5;
+input int MaxSpreadPoints = 20;  // Max spread in points (e.g., 2 pips on Gold)
+
+//--- Globals
+CTrade trade;
+int hEMA9, hEMA21, hRSI, hBB, hATR, hEMA200H1;
+double ema9[], ema21[], rsi[], bbUpper[], bbLower[], bbMiddle[], atr[], ema200H1[];
+datetime latestBarTime = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit() {
+    trade.SetExpertMagicNumber(MagicNumber);
+    hEMA9 = iMA(_Symbol, PERIOD_M1, EMAShort, 0, MODE_EMA, PRICE_CLOSE);
+    hEMA21 = iMA(_Symbol, PERIOD_M1, EMALong, 0, MODE_EMA, PRICE_CLOSE);
+    hRSI = iRSI(_Symbol, PERIOD_M1, RSIPeriod, PRICE_CLOSE);
+    hBB = iBands(_Symbol, PERIOD_M1, BBPeriod, 0, BBDeviation, PRICE_CLOSE);
+    hATR = iATR(_Symbol, PERIOD_M1, ATRPeriod);
+    hEMA200H1 = iMA(_Symbol, PERIOD_H1, 200, 0, MODE_EMA, PRICE_CLOSE);
+    
+    ArraySetAsSeries(ema9, true); ArraySetAsSeries(ema21, true); ArraySetAsSeries(rsi, true);
+    ArraySetAsSeries(bbUpper, true); ArraySetAsSeries(bbLower, true); ArraySetAsSeries(bbMiddle, true); 
+    ArraySetAsSeries(atr, true); ArraySetAsSeries(ema200H1, true);
+    
+    if (hEMA9 == INVALID_HANDLE || hEMA21 == INVALID_HANDLE || hRSI == INVALID_HANDLE || 
+        hBB == INVALID_HANDLE || hATR == INVALID_HANDLE || hEMA200H1 == INVALID_HANDLE) {
+        Print("Failed to create indicator handles");
+        return(INIT_FAILED);
+    }
+    
+    Print("Gold HFT Scalper Initialized on M1");
+    return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+    IndicatorRelease(hEMA9); IndicatorRelease(hEMA21); IndicatorRelease(hRSI);
+    IndicatorRelease(hBB); IndicatorRelease(hATR); IndicatorRelease(hEMA200H1);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick() {
+    MqlTick tick; 
+    if (!SymbolInfoTick(_Symbol, tick)) return;
+    
+    // Spread filter
+    double spread = (tick.ask - tick.bid) / _Point;
+    if (spread > MaxSpreadPoints) return;
+    
+    // Trailing stop for open positions
+    if (HasOpenPosition()) {
+        TrailStop();
+        return;  // Only one position, no new entries
+    }
+    
+    if (!IsNewBar()) return;
+    if (!IsInSession()) return;
+    
+    // Copy H1 EMA for bias
+    if (CopyBuffer(hEMA200H1, 0, 0, 2, ema200H1) < 2) return;
+    bool bullBias = (tick.bid > ema200H1[0]);
+    bool bearBias = (tick.bid < ema200H1[0]);
+    
+    // Copy M1 indicators
+    if (CopyBuffer(hEMA9, 0, 0, 3, ema9) < 3 || CopyBuffer(hEMA21, 0, 0, 3, ema21) < 3 ||
+        CopyBuffer(hRSI, 0, 0, 2, rsi) < 2 || CopyBuffer(hBB, 1, 0, 2, bbUpper) < 2 ||
+        CopyBuffer(hBB, 2, 0, 2, bbLower) < 2 || CopyBuffer(hATR, 0, 0, 2, atr) < 2) return;
+    
+    MqlRates rates[]; ArraySetAsSeries(rates, true);
+    if (CopyRates(_Symbol, PERIOD_M1, 0, 3, rates) < 3) return;
+    
+    // Simple Heiken Ashi (HA close > HA open for green)
+    double haClose1 = (rates[1].open + rates[1].high + rates[1].low + rates[1].close) / 4.0;
+    double haOpen1 = (rates[2].open + rates[2].close) / 2.0;  // Prev HA open approx
+    double haOpen2 = (haOpen1 + (rates[2].open + rates[2].high + rates[2].low + rates[2].close)/4.0) / 2.0;  // Better approx
+    bool haGreen = (haClose1 > haOpen1);
+    bool haRed = (haClose1 < haOpen1);
+    
+    // BB Squeeze: Width < ATR * 1.5 (adjusted for Gold volatility)
+    double bbWidth = bbUpper[1] - bbLower[1];
+    bool squeeze = (bbWidth < atr[1] * 1.5);
+    
+    // Buy Signal: EMA cross up, RSI >55, touch BB lower, HA green, squeeze, bull bias
+    if (bullBias && ema9[1] > ema21[1] && ema9[2] <= ema21[2] && rsi[1] > RSIOverbought &&
+        rates[1].low <= bbLower[1] && haGreen && squeeze) {
+        double sl = NormalizeDouble(tick.bid - (atr[1] * ATRMultiplierSL), _Digits);
+        double tp = NormalizeDouble(tick.ask + (TP_Multiple * (tick.ask - sl)), _Digits);
+        double lots = CalculateLots(tick.ask, sl);
+        if (lots > 0) {
+            if (trade.Buy(lots, _Symbol, tick.ask, sl, tp, "Gold HFT Buy")) {
+                Print("Buy Entry: ", tick.ask, " SL: ", sl, " TP: ", tp, " Lots: ", lots);
+            } else {
+                Print("Buy failed: ", trade.ResultRetcode());
+            }
+        }
+    }
+    
+    // Sell Signal: EMA cross down, RSI <45, touch BB upper, HA red, squeeze, bear bias
+    if (bearBias && ema9[1] < ema21[1] && ema9[2] >= ema21[2] && rsi[1] < RSIOversold &&
+        rates[1].high >= bbUpper[1] && haRed && squeeze) {
+        double sl = NormalizeDouble(tick.bid + (atr[1] * ATRMultiplierSL), _Digits);
+        double tp = NormalizeDouble(tick.bid - (TP_Multiple * (sl - tick.bid)), _Digits);
+        double lots = CalculateLots(tick.bid, sl);
+        if (lots > 0) {
+            if (trade.Sell(lots, _Symbol, tick.bid, sl, tp, "Gold HFT Sell")) {
+                Print("Sell Entry: ", tick.bid, " SL: ", sl, " TP: ", tp, " Lots: ", lots);
+            } else {
+                Print("Sell failed: ", trade.ResultRetcode());
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Helper Functions                                                 |
+//+------------------------------------------------------------------+
+bool IsNewBar() {
+    datetime time[1]; 
+    if (CopyTime(_Symbol, PERIOD_M1, 0, 1, time) < 1) return false;
+    if (time[0] != latestBarTime) { 
+        latestBarTime = time[0]; 
+        return true; 
+    }
+    return false;
+}
+
+bool IsInSession() {
+    MqlDateTime dt; 
+    TimeToStruct(TimeGMT(), dt);
+    int hour = dt.hour;
+    return (hour >= 8 && hour <= 17);  // GMT: London (8-12) + NY (13-17)
+}
+
+bool HasOpenPosition() {
+    if (!PositionSelect(_Symbol)) return false;
+    return (PositionGetInteger(POSITION_MAGIC) == MagicNumber);
+}
+
+double CalculateLots(double entry, double sl) {
+    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+    double riskAmount = balance * risk;
+    double slPips = MathAbs(entry - sl) / _Point;
+    if (slPips <= 0) return 0.0;
+    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+    double lots = riskAmount / (slPips * tickValue);
+    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+    lots = MathMax(minLot, MathMin(maxLot, NormalizeDouble(lots / step, 0) * step));
+    return lots;
+}
+
+void TrailStop() {
+    if (!PositionSelect(_Symbol)) return;
+    if (PositionGetInteger(POSITION_MAGIC) != MagicNumber) return;
+    
+    double posOpen = PositionGetDouble(POSITION_PRICE_OPEN);
+    double posSL = PositionGetDouble(POSITION_SL);
+    double posTP = PositionGetDouble(POSITION_TP);
+    ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+    double currentPrice = (posType == POSITION_TYPE_BUY) ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+    
+    double profitDistance = (posType == POSITION_TYPE_BUY) ? (currentPrice - posOpen) : (posOpen - currentPrice);
+    double initialRisk = MathAbs(posOpen - posSL);
+    
+    if (profitDistance > initialRisk) {  // Profit > 1:1 RR
+        double newSL;
+        if (posType == POSITION_TYPE_BUY) {
+            newSL = NormalizeDouble(posOpen + 10 * _Point, _Digits);  // BE + 1 pip buffer (adjust for Gold)
+            if (newSL > posSL) {
+                trade.PositionModify(_Symbol, newSL, posTP);
+                Print("Buy SL trailed to BE: ", newSL);
+            }
+        } else {
+            newSL = NormalizeDouble(posOpen - 10 * _Point, _Digits);
+            if (newSL < posSL) {
+                trade.PositionModify(_Symbol, newSL, posTP);
+                Print("Sell SL trailed to BE: ", newSL);
+            }
+        }
+    }
+}
+//+------------------------------------------------------------------+
